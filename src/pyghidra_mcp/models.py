@@ -80,6 +80,14 @@ class GuiContextResponse(BaseModel):
     location_type: str | None = None
 
 
+class ClearRangeResponse(BaseModel):
+    binary_name: str
+    start: str
+    end: str
+    code_units_cleared: int
+    symbols_removed: list[str] = []
+
+
 class CreateFunctionResponse(BaseModel):
     binary_name: str
     address: str

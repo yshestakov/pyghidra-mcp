@@ -20,6 +20,7 @@ from pyghidra_mcp.models import (
     CallGraphDisplayType,
     CallGraphResult,
     CodeSearchResults,
+    ClearRangeResponse,
     CommentResponse,
     CreateFunctionResponse,
     CrossReferenceInfos,
@@ -292,25 +293,62 @@ def get_gui_context(ctx: Context) -> GuiContextResponse:
 
 
 @mcp_error_handler
-def create_function(
+def clear_range(
     binary_name: str,
     address: str,
+    length: int,
     ctx: Context,
-    name: str | None = None,
-    thumb: bool | None = None,
-) -> CreateFunctionResponse:
-    """Define a function at an address that analysis missed (disassembles first).
+    clear_symbols: bool = False,
+) -> ClearRangeResponse:
+    """Undefine instructions and data in [address, address+length) (Ghidra "Clear Code Bytes").
 
-    On ARM/Cortex-M an odd address (e.g. a vector-table entry 0x08031C05) is
-    treated as Thumb and bit 0 is cleared. Pass `thumb` to force the mode.
-    Optional `name` sets the function name. Call `save` afterwards to persist.
+    Use when analysis defined code as data (DAT_*, s_* strings) or vice versa.
+    Dynamic labels (DAT_*/LAB_*) vanish on their own; `clear_symbols` also deletes
+    stored labels in the range. Refuses ranges that overlap a function.
+    Max length 0x10000. Call `save` afterwards to persist.
     """
     pyghidra_context: MCPContext = ctx.request_context.lifespan_context
     program_info = pyghidra_context.get_program_info(binary_name)
     tools = GhidraTools(program_info)
     result = _run_for_context(
         pyghidra_context,
-        lambda: tools.create_function(address, name=name, thumb=thumb),
+        lambda: tools.clear_range(address, length, clear_symbols=clear_symbols),
+    )
+    result = cast(dict, result)
+    return ClearRangeResponse(binary_name=binary_name, **result)
+
+
+@mcp_error_handler
+def create_function(
+    binary_name: str,
+    address: str,
+    ctx: Context,
+    name: str | None = None,
+    thumb: bool | None = None,
+    clear_length: int = 0,
+    clear_symbols: bool = False,
+) -> CreateFunctionResponse:
+    """Define a function at an address that analysis missed (disassembles first).
+
+    On ARM/Cortex-M an odd address (e.g. a vector-table entry 0x08031C05) is
+    treated as Thumb and bit 0 is cleared. Pass `thumb` to force the mode.
+    Optional `name` sets the function name. If the code was wrongly defined as
+    data (DAT_*, strings), pass `clear_length` (bytes) to undefine that many bytes
+    from the entry first; `clear_symbols` also deletes stored labels there.
+    Call `save` afterwards to persist.
+    """
+    pyghidra_context: MCPContext = ctx.request_context.lifespan_context
+    program_info = pyghidra_context.get_program_info(binary_name)
+    tools = GhidraTools(program_info)
+    result = _run_for_context(
+        pyghidra_context,
+        lambda: tools.create_function(
+            address,
+            name=name,
+            thumb=thumb,
+            clear_length=clear_length,
+            clear_symbols=clear_symbols,
+        ),
     )
     result = cast(dict, result)
     return CreateFunctionResponse(binary_name=binary_name, **result)

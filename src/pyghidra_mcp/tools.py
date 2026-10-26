@@ -967,7 +967,12 @@ class GhidraTools:
 
     @handle_exceptions
     def create_function(
-        self, address: str, name: str | None = None, thumb: bool | None = None
+        self,
+        address: str,
+        name: str | None = None,
+        thumb: bool | None = None,
+        clear_length: int = 0,
+        clear_symbols: bool = False,
     ) -> dict:
         """Disassemble from an entry point and define a function there.
 
@@ -980,26 +985,21 @@ class GhidraTools:
         from ghidra.program.model.symbol import SourceType  # type: ignore
         from ghidra.util.task import TaskMonitor  # type: ignore
 
-        raw = address.strip().lower()
-        if raw.startswith("0x"):
-            raw = raw[2:]
-        try:
-            value = int(raw.replace("_", ""), 16)
-        except ValueError as e:
-            raise ValueError(f"Invalid address format '{address}'") from e
-
         program = self.program
+        value = self._parse_hex(address)
         is_arm = "ARM" in str(program.getLanguage().getProcessor())
         if is_arm and value & 1:
             value &= ~1
             if thumb is None:
                 thumb = True
-
-        addr = program.getAddressFactory().getDefaultAddressSpace().getAddress(value)
-        if not program.getMemory().contains(addr):
-            raise ValueError(f"Address {addr} is not in mapped memory")
+        addr = self._to_mapped_address(value)
 
         fm = program.getFunctionManager()
+        cleared = None
+        if clear_length > 0:
+            cleared = self.clear_range(
+                str(addr), clear_length, clear_symbols=clear_symbols
+            )
         existing = fm.getFunctionAt(addr)
         if existing is not None:
             return self._function_summary(existing, created=False, thumb=thumb,
@@ -1034,7 +1034,103 @@ class GhidraTools:
         if func is None:
             raise ValueError(f"No function at {addr} after creation")
         self.invalidate_decompiler_cache()
-        return self._function_summary(func, created=True, thumb=thumb, message="Created")
+        message = "Created"
+        if cleared is not None:
+            message += (
+                f" after clearing {cleared['code_units_cleared']} code units"
+                f" and {len(cleared['symbols_removed'])} symbols"
+                f" in {cleared['start']}-{cleared['end']}"
+            )
+        return self._function_summary(func, created=True, thumb=thumb, message=message)
+
+    MAX_CLEAR_LENGTH = 0x10000
+
+    @staticmethod
+    def _parse_hex(address: str) -> int:
+        raw = address.strip().lower()
+        if raw.startswith("0x"):
+            raw = raw[2:]
+        try:
+            return int(raw.replace("_", ""), 16)
+        except ValueError as e:
+            raise ValueError(f"Invalid address format '{address}'") from e
+
+    def _to_mapped_address(self, value: int):
+        addr = self.program.getAddressFactory().getDefaultAddressSpace().getAddress(value)
+        if not self.program.getMemory().contains(addr):
+            raise ValueError(f"Address {addr} is not in mapped memory")
+        return addr
+
+    @handle_exceptions
+    def clear_range(self, address: str, length: int, clear_symbols: bool = False) -> dict:
+        """Undefine instructions/data in [address, address+length) ("Clear Code Bytes").
+
+        Dynamic labels (DAT_*, LAB_*, FUN_*) are derived from references and need no
+        removal. With clear_symbols, stored labels in the range (analysis or user
+        labels such as s_*) are deleted too. Ranges overlapping a function are refused.
+        """
+        from ghidra.program.model.address import AddressSet  # type: ignore
+        from ghidra.program.model.symbol import SymbolType  # type: ignore
+
+        if length <= 0:
+            raise ValueError("length must be > 0")
+        if length > self.MAX_CLEAR_LENGTH:
+            raise ValueError(f"length must be <= {self.MAX_CLEAR_LENGTH:#x}")
+
+        program = self.program
+        value = self._parse_hex(address)
+        if "ARM" in str(program.getLanguage().getProcessor()):
+            value &= ~1
+        start = self._to_mapped_address(value)
+        end = start.add(length - 1)
+        if not program.getMemory().contains(end):
+            raise ValueError(f"End address {end} is not in mapped memory")
+        aset = AddressSet(start, end)
+
+        overlapping = []
+        fit = program.getFunctionManager().getFunctionsOverlapping(aset)
+        while fit.hasNext():
+            f = fit.next()
+            overlapping.append(f"{f.getName()} @ {f.getEntryPoint()}")
+        if overlapping:
+            raise ValueError(
+                "Range overlaps existing function(s): " + ", ".join(overlapping)
+                + ". Delete or shrink them first."
+            )
+
+        listing = program.getListing()
+        count = 0
+        for it in (listing.getDefinedData(aset, True), listing.getInstructions(aset, True)):
+            while it.hasNext():
+                it.next()
+                count += 1
+
+        removed = []
+        with ghidra_transaction(program, f"pyghidra-mcp: clear {start}-{end}"):
+            listing.clearCodeUnits(start, end, False)
+            if clear_symbols:
+                st = program.getSymbolTable()
+                sit = st.getSymbolIterator(start, True)
+                doomed = []
+                while sit.hasNext():
+                    sym = sit.next()
+                    if sym.getAddress().compareTo(end) > 0:
+                        break
+                    if sym.isDynamic() or sym.getSymbolType() == SymbolType.FUNCTION:
+                        continue
+                    doomed.append(sym)
+                for sym in doomed:
+                    label = f"{sym.getName()} @ {sym.getAddress()}"
+                    if sym.delete():
+                        removed.append(label)
+
+        self.invalidate_decompiler_cache()
+        return {
+            "start": str(start),
+            "end": str(end),
+            "code_units_cleared": count,
+            "symbols_removed": removed,
+        }
 
     def _function_summary(self, func, created: bool, thumb, message: str) -> dict:
         body = func.getBody()
